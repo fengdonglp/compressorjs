@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <!-- 设置360浏览器渲染模式为极速内核 -->
+  <meta name="renderer" content="webkit" />
+  <!-- 优先使用 IE 最新版本和 Chrome -->
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+  <!-- 页面描述  seo -->
+  <meta name="description" content="" />
+  <!-- 页面关键词 seo -->
+  <meta name="keywords" content="" />
+  <meta name="viewport" content="maximum-scale=1.0,minimum-scale=1.0,width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title></title>
+</head>
+<body>
+  <input type="file" id="file" accept="image/*">
+  <script src="./dist/compressor.js"></script>
+  <script>
+    document.getElementById('file').addEventListener('change', (e) => {
+      const file = e.target.files[0];
+
+      if (!file) {
+        return;
+      }
+
+      new Compressor(file, {
+        quality: 0.6, // 默认质量
+        minWidth: 500, // 图片最小宽度
+        convertSize: [90000, 100000], // 压缩大小
+        force: true, // 是否强制压缩至指定压缩大小区间
+        success(result, oResult) {
+          console.log(result, oResult)
+        },
+        error(err) {
+          console.log(err.message);
+        },
+      });
+    });
+  </script>
+</body>
+</html>

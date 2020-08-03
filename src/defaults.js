@@ -119,4 +119,16 @@ export default {
    * }
    */
   error: null,
+
+  /**
+   * 是否强制压缩图片到指定的压缩大小
+   * @type {Boolean}
+   */
+  force: false,
+
+  /**
+   * 是否在控制台输出日志
+   * @type {Boolean}
+   */
+  log: false,
 };

@@ -1,3 +1,4 @@
+/* eslint-disable no-console */
 import toBlob from 'blueimp-canvas-to-blob';
 import isBlob from 'is-blob';
 import DEFAULTS from './defaults';
@@ -17,6 +18,7 @@ const { ArrayBuffer, FileReader } = WINDOW;
 const URL = WINDOW.URL || WINDOW.webkitURL;
 const REGEXP_EXTENSION = /\.\w+$/;
 const AnotherCompressor = WINDOW.Compressor;
+const MAX_DRAW_SIZE = 4500; // canvas画布最大宽度/最大长度，保证移动端性能，移动端如果超出一定尺寸会挂掉
 
 /**
  * Creates a new image compressor.
@@ -25,11 +27,11 @@ const AnotherCompressor = WINDOW.Compressor;
 export default class Compressor {
   /**
    * The constructor of Compressor.
-   * @param {File|Blob} file - The target image file for compressing.
+   * @param {File|Blob|String} file - The target image file for compressing. 值可以为base64
    * @param {Object} [options] - The options for compressing.
    */
   constructor(file, options) {
-    this.file = file;
+    this.file = file instanceof File || file instanceof Blob ? file : toBlob(file);
     this.image = new Image();
     this.options = {
       ...DEFAULTS,
@@ -37,6 +39,9 @@ export default class Compressor {
     };
     this.aborted = false;
     this.result = null;
+    this.convertRangeSize = null;
+    this.binaryCompressDimension = null;
+    this.binaryCompressQuality = null;
     this.init();
   }
 
@@ -151,15 +156,17 @@ export default class Compressor {
     scaleX = 1,
     scaleY = 1,
   }) {
+    this.minMaxSize();
     const { file, image, options } = this;
     const canvas = document.createElement('canvas');
     const context = canvas.getContext('2d');
     const aspectRatio = naturalWidth / naturalHeight;
     const is90DegreesRotated = Math.abs(rotate) % 180 === 90;
-    let maxWidth = Math.max(options.maxWidth, 0) || Infinity;
-    let maxHeight = Math.max(options.maxHeight, 0) || Infinity;
-    let minWidth = Math.max(options.minWidth, 0) || 0;
-    let minHeight = Math.max(options.minHeight, 0) || 0;
+    let maxWidth = Math.max(options.maxWidth, 0) || MAX_DRAW_SIZE;
+    let maxHeight = Math.max(options.maxHeight, 0) || MAX_DRAW_SIZE;
+    // 如果设定的最小宽高小于原始宽高，则使用原始宽高
+    let minWidth = Math.min(naturalWidth, Math.max(options.minWidth, 0)) || 0;
+    let minHeight = Math.min(naturalHeight, Math.max(options.minHeight, 0)) || 0;
     let width = Math.max(options.width, 0) || naturalWidth;
     let height = Math.max(options.height, 0) || naturalHeight;
 
@@ -199,6 +206,8 @@ export default class Compressor {
       width = height * aspectRatio;
     }
 
+    this.minWidth = minWidth;
+
     width = Math.floor(normalizeDecimalNumber(Math.min(Math.max(width, minWidth), maxWidth)));
     height = Math.floor(normalizeDecimalNumber(Math.min(Math.max(height, minHeight), maxHeight)));
 
@@ -206,6 +215,7 @@ export default class Compressor {
     const destY = -height / 2;
     const destWidth = width;
     const destHeight = height;
+    let compressResult = null;
 
     if (is90DegreesRotated) {
       [width, height] = [height, width];
@@ -221,7 +231,7 @@ export default class Compressor {
     let fillStyle = 'transparent';
 
     // Converts PNG files over the `convertSize` to JPEGs.
-    if (file.size > options.convertSize && options.mimeType === 'image/png') {
+    if (file.size > this.convertRangeSize[1] && options.mimeType === 'image/png') {
       fillStyle = '#fff';
       options.mimeType = 'image/jpeg';
     }
@@ -245,6 +255,20 @@ export default class Compressor {
     context.drawImage(image, destX, destY, destWidth, destHeight);
     context.restore();
 
+    // 统计压缩次数
+    this.binaryCount = 0;
+    try {
+      if (options.force) {
+        compressResult = this.toSpecifiedSize({
+          canvas,
+          context,
+          mimeType: options.mimeType,
+        });
+      }
+    } catch (error) {
+      console.log(error);
+    }
+
     if (options.drew) {
       options.drew.call(this, context, canvas);
     }
@@ -253,27 +277,300 @@ export default class Compressor {
       return;
     }
 
-    const done = (result) => {
+    const done = (result, otherResult) => {
       if (!this.aborted) {
         this.done({
           naturalWidth,
           naturalHeight,
           result,
+          otherResult,
         });
       }
     };
 
-    if (canvas.toBlob) {
-      canvas.toBlob(done, options.mimeType, options.quality);
+    this.log('compressResult: ', compressResult);
+
+    if (canvas.toBlob && !options.force) {
+      canvas.toBlob((blob) => {
+        const base64 = canvas.toDataURL(options.mimeType, options.quality);
+        done({
+          base64,
+          result: this.compareResult(blob.size),
+        }, blob);
+      }, options.mimeType, options.quality);
     } else {
-      done(toBlob(canvas.toDataURL(options.mimeType, options.quality)));
+      done(compressResult, toBlob(compressResult.base64));
     }
+  }
+
+  toSpecifiedSize({
+    canvas,
+    context,
+    mimeType,
+  }) {
+    // 压缩策略
+    // 1. 比较当前压缩结果是否符合要求，0和1则直接返回，如果是2则进入递归压缩
+    // 2. 首先根据默认/用户指定最小尺寸进行大小压缩
+
+    const {
+      minWidth,
+      options,
+      image,
+    } = this;
+    const { width, height } = canvas;
+    const aspectRatio = width / height;
+    const { quality } = options;
+    const img = canvas.toDataURL(mimeType, quality);
+    const imgSize = toBlob(img).size;
+    const result = this.compareResult(imgSize);
+
+    this.log('转换后的压缩大小区间：', this.convertRangeSize);
+
+    let varWidth = width;
+    let varHeight = height;
+
+    // 初次压缩结果符合要求或者小于压缩最小要求
+    if (result === 0 || result === 1) {
+      return {
+        base64: img,
+        compressedSize: imgSize,
+        result,
+      };
+    }
+
+    const params = {
+      canvas, context, image, mimeType, width, height, quality,
+    };
+
+    // TODO 测试程序，待删除
+    // Compressor.testSizeOrQuality(params);
+
+    this.binaryCompressQuality = {
+      left: 0,
+      right: quality,
+    };
+
+    if (minWidth < width) {
+      this.binaryCompressDimension = {
+        left: minWidth,
+        right: width,
+      };
+      varWidth = minWidth;
+      varHeight = varWidth / aspectRatio;
+      const [
+        base64,
+        compressedSize,
+      ] = this.transformToBase64(Object.assign(params, {
+        width: varWidth,
+        height: varHeight,
+      }));
+
+      const compressResult = this.compareResult(compressedSize);
+
+      if (compressResult === 1) {
+        return {
+          base64,
+          compressedSize,
+          result: compressResult,
+        };
+      }
+
+      if (compressResult === 2) {
+        return this.compressByQuality(params);
+      }
+
+      return this.compressBySize(Object.assign(params, {
+        width: varWidth,
+        height: varHeight,
+      }));
+    }
+
+    return this.compressByQuality(params);
+  }
+
+  // eslint-disable-next-line class-methods-use-this
+  transformToBase64({
+    canvas, context, image, mimeType, width, height, quality,
+  }) {
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    canvas.width = width;
+    canvas.height = height;
+    context.drawImage(image, 0, 0, width, height);
+
+    return this.transformCanvasToSize({
+      canvas,
+      mimeType,
+      quality,
+    });
+  }
+
+  // eslint-disable-next-line class-methods-use-this
+  transformCanvasToSize({
+    canvas,
+    mimeType,
+    quality,
+  }) {
+    const base64 = canvas.toDataURL(mimeType, quality);
+    const compressedSize = toBlob(base64).size;
+
+    return [base64, compressedSize];
+  }
+
+  // 根据 convertSize 生成图片压缩的大小区间范围
+  minMaxSize() {
+    const { convertSize } = this.options;
+    let maxSize = Number.MAX_VALUE;
+    let minSize = 0;
+
+    if (Array.isArray(convertSize)) {
+      if (convertSize.length === 2) {
+        [minSize, maxSize] = convertSize;
+        // TODO 是否提示用户给出的区间差距如果过分小，压缩会很慢
+        if (minSize >= maxSize) {
+          maxSize = minSize;
+          minSize = 0;
+        }
+      } else if (convertSize.length === 1) {
+        [maxSize] = convertSize;
+      }
+    } else if (Number(convertSize) > 0) {
+      maxSize = convertSize;
+    }
+
+    this.convertRangeSize = [minSize, maxSize];
+
+    return this.convertRangeSize;
+  }
+
+  /**
+   * @description
+   * @param {Number} size 压缩大小
+   * @param {Number} maxSize 最大压缩大小
+   * @param {Number} minSize 最小压缩大小
+   * @returns {Number} 压缩后尺寸比对结果
+   * @memberof Compressor
+   */
+  // eslint-disable-next-line class-methods-use-this
+  compareResult(size) {
+    // 压缩结果
+    // 0：压缩后结果小于等于最小要求
+    // 1: 压缩结果符合要求
+    // 2: 压缩结果大于等于最大要求
+    const [minSize, maxSize] = this.convertRangeSize;
+
+    if (size <= minSize) {
+      return 0;
+    }
+
+    if (size > minSize && size < maxSize) {
+      return 1;
+    }
+
+    return 2;
+  }
+
+  compressByQuality(params) {
+    this.binaryCount += 1;
+    // eslint-disable-next-line prefer-const
+    let { quality, beforeCompressedSize } = params;
+
+    const [
+      base64,
+      compressedSize,
+    ] = this.transformCanvasToSize(params);
+
+    const compressResult = this.compareResult(compressedSize);
+
+    this.log('compressByQuality: ', quality, this.binaryCompressQuality.left, this.binaryCompressQuality.right, compressedSize);
+
+    // 三种情况：
+    // 1.压缩结果符合要求；
+    // 2.压缩质量小叔叔微超过五位，无法压缩；
+    // 3.上次压缩和本地压缩结果一致，表明已经压缩到极限，无法继续压缩下去
+    if (compressResult === 1 || quality <= 0.00001 || beforeCompressedSize === compressedSize) {
+      return {
+        base64,
+        compressedSize,
+        result: compressResult,
+      };
+    }
+
+    if (compressResult === 2) {
+      this.binaryCompressQuality.right = quality;
+    }
+
+    if (compressResult === 0) {
+      this.binaryCompressQuality.left = quality;
+    }
+
+    const { left, right } = this.binaryCompressQuality;
+    quality = (left + right) / 2;
+
+    return this.compressByQuality(Object.assign(params, {
+      quality,
+      beforeCompressedSize: compressedSize,
+    }));
+  }
+
+  // TODO 异常处理：如果用户给出的convertSize最小和最大差距很小，那么会不会出现死循环
+  compressBySize(params) {
+    this.binaryCount += 1;
+    const {
+      canvas, width,
+    } = params;
+    const {
+      minWidth,
+    } = this;
+    const aspectRatio = canvas.width / canvas.height;
+    let varWidth = width;
+    let varHeight = varWidth / aspectRatio;
+    const [
+      base64,
+      compressedSize,
+    ] = this.transformToBase64(Object.assign(params, {
+      width: varWidth,
+      height: varHeight,
+    }));
+
+    const compressResult = this.compareResult(compressedSize);
+
+    this.log('compressBySize: ', varWidth, this.binaryCompressDimension.left, this.binaryCompressDimension.right, compressedSize);
+
+    if (compressResult === 1 || width <= 50) {
+      return {
+        base64,
+        compressedSize,
+        result: compressResult,
+      };
+    }
+
+    if (compressResult === 2 && minWidth === width) {
+      return this.compressByQuality(canvas, compressedSize);
+    }
+
+    if (compressResult === 2) {
+      this.binaryCompressDimension.right = width;
+    }
+
+    if (compressResult === 0) {
+      this.binaryCompressDimension.left = width;
+    }
+
+    const { left, right } = this.binaryCompressDimension;
+    varWidth = (left + right) / 2;
+    varHeight = varWidth / aspectRatio;
+
+    return this.compressBySize(Object.assign(params, {
+      width: varWidth,
+      height: varHeight,
+    }));
   }
 
   done({
     naturalWidth,
     naturalHeight,
     result,
+    otherResult,
   }) {
     const { file, image, options } = this;
 
@@ -313,7 +610,7 @@ export default class Compressor {
     this.result = result;
 
     if (options.success) {
-      options.success.call(this, result);
+      options.success.call(this, result, otherResult);
     }
   }
 
@@ -342,6 +639,12 @@ export default class Compressor {
     }
   }
 
+  log(...args) {
+    if (this.options.log) {
+      console.log(...args);
+    }
+  }
+
   /**
    * Get the no conflict compressor class.
    * @returns {Compressor} The compressor class.
@@ -357,5 +660,43 @@ export default class Compressor {
    */
   static setDefaults(options) {
     Object.assign(DEFAULTS, options);
+  }
+
+  // 测试图片尺寸和质量对体积的影响
+  static testSizeOrQuality({
+    canvas, context, image, mimeType, width, height, quality,
+  }) {
+    const ratio = width / height;
+    let size = Number.MAX_VALUE;
+    let testQuality = quality;
+
+    canvas.width = width;
+    canvas.height = height;
+    context.clearRect(0, 0, width, height);
+
+    context.drawImage(image, 0, 0, width, height);
+
+    console.log('start quality');
+    while (testQuality >= 0.01) {
+      const ba = canvas.toDataURL(mimeType, testQuality);
+      size = btoa(ba).length;
+      console.log(testQuality, btoa(ba).length / 1024);
+      testQuality -= 0.01;
+    }
+
+    console.log('start size');
+    while (width > 100 && size > 10 * 1024) {
+      canvas.width = width;
+      canvas.height = height;
+      context.clearRect(0, 0, width, height);
+
+      context.drawImage(image, 0, 0, width, height);
+
+      const ba = canvas.toDataURL(mimeType, quality);
+      size = btoa(ba).length;
+      console.log(`${width}*${height}`, btoa(ba).length / 1024);
+      width -= 100;
+      height = width / ratio;
+    }
   }
 }
